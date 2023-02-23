@@ -61,7 +61,7 @@ class class_avas_solar
 
   public static $cron_exit_condition;
 
-  public $bv_avg_arr;
+  public static $bv_avg_arr;
   public $psolar_avg_arr;
   public $pload_avg;
   public $count_for_averaging;
