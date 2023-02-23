@@ -41,7 +41,8 @@ class class_avas_solar
 	// The current version of the plugin.
 	public static $version;
 
-  //
+  public static $cloudiness_forecast;
+
   public static $config;
 
   public static $verbose;
