@@ -3817,4 +3817,4 @@ class class_avas_solar
 
 }
 
-avas_solar::init();
+class_avas_solar::init();
