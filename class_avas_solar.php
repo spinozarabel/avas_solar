@@ -54,6 +54,8 @@ class class_avas_solar
   // This is an array that holds details of status of Shelly ACIN switch
   public static $shelly_switch_acin_details;
 
+  public static $studer_readings_obj;
+
   // This is an array that holds user meta for user obtained using the user_index in the CRON loop
   public static $all_usermeta;
 
