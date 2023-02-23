@@ -48,6 +48,16 @@ class class_avas_solar
 
   public static $lat, $lon, $utc_offset, $timezone;
 
+  public static $soc_updated_using_shelly_energy_readings;
+
+  // This is an array that holds details of status of Shelly ACIN switch
+  public static $shelly_switch_acin_details;
+
+  // This is an array that holds user meta for user obtained using the user_index in the CRON loop
+  public static $all_usermeta;
+
+  public static $cron_exit_condition;
+
   public $bv_avg_arr;
   public $psolar_avg_arr;
   public $pload_avg;
@@ -107,6 +117,16 @@ class class_avas_solar
 
       self::manage_transient_cloudiness_forecast();
     }
+
+
+    /**
+     * 
+     */
+    public static function set_default_timezone()
+    {
+      date_default_timezone_set("Asia/Kolkata");
+    }
+
 
     /**
      * 
@@ -389,13 +409,14 @@ class class_avas_solar
      *  A data object is created and stored as a transient to be accessed by an AJAX request running asynchronously to the CRON
      */
     public static function shellystuder_cron_exec()
-    {                        // Loop over all of the eligible users
+    {                        
+        // load the config
         $config = self::get_config();
 
-        // rerun the class init since there are some time dependednt state changes possible
-        self::init();
+        // Since the weather is common for all it is outside the loop
+        self::manage_transient_cloudiness_forecast();
 
-        foreach ($config['accounts'] as $user_index => $account)
+        foreach ($config['accounts'] as $user_index => $account)  // Loop over all of the eligible users
         {
             $wp_user_name = $account['wp_user_name'];
 
@@ -406,14 +427,27 @@ class class_avas_solar
 
             $wp_user_ID           = $wp_user_obj->ID;
 
+            // get all user meta for thie user with this ID into an array
+            $all_usermeta = self::get_all_usermeta( $user_index, $wp_user_ID );
+
+
+            // get the complete SCIN Shelly switch status details for this user into an array
+            self::get_shelly_switch_acin_details( $user_index );
+
+            // Get from the global that was refreshed by previous call
+            $shelly_switch_acin_details = self::$shelly_switch_acin_details;
+
                             // extract the control flag as set in user meta
-            $do_shelly_user_meta  = get_user_meta($wp_user_ID, "do_shelly", true) ?? false;
+            $do_shelly_user_meta  = self::$all_usermeta['do_shelly'] ?? false;
+            // $do_shelly_user_meta  = get_user_meta($wp_user_ID, "do_shelly", true) ?? false;
 
             // extract the control flag as set in user meta
-            $do_minutely_updates  = get_user_meta($wp_user_ID, "do_minutely_updates", true) ?? false;
+            $do_minutely_updates  = self::$all_usermeta['do_minutely_updates'] ?? false;
+            // $do_minutely_updates  = get_user_meta($wp_user_ID, "do_minutely_updates", true) ?? false;
 
             // Check if the control flag for minutely updates is TRUE. If so get the readings
-            if( $do_minutely_updates ) {
+            if( $do_minutely_updates ) 
+            {
 
                 // get all the readings for this user. This will write the data to a transient for quick retrieval
                 self::get_readings_and_servo_grid_switch( $user_index, $wp_user_ID, $wp_user_name, $do_shelly_user_meta );
@@ -425,8 +459,454 @@ class class_avas_solar
     }
 
 
+    /**
+     *  @param object:$return_obj has as properties values from API call on Shelly 4PM and calculations thereof
+     *  Update SOC using Shelly energy readings do not update usermeta for soc_percentage_now
+     *  The update only happens if SOC after dark baselining has happened and it is still dark now
+     *  This routine is typically called when the Studer API call fails and it is still dark.
+     */
+    public static function compute_soc_from_shelly_energy_readings( int $user_index, int $wp_user_ID, string $wp_user_name): ? object
+    {
+      // set default timezone to Asia Kolkata
+      self::set_default_timezone();
+
+      // get the installed battery capacity in KWH from config
+      $SOC_capacity_KWH                   = self::$config['accounts'][$user_index]['battery_capacity'];
+
+      // This is the value of the SOC as updated by Studer API, captured just after dark
+      $soc_update_from_studer_after_dark  = self::$all_usermeta['soc_update_from_studer_after_dark'];
+
+      // This is the Shelly energy counter at the moment of SOC capture just after dark
+      $shelly_energy_counter_after_dark   = self::$all_usermeta['shelly_energy_counter_after_dark'];
+
+      // This is the tiestamp at the moent of SOC capture just after dark
+      $timestamp_soc_capture_after_dark   = self::$all_usermeta['timestamp_soc_capture_after_dark'];
+
+      $soc_percentage_lvds_setting        = self::$all_usermeta['soc_percentage_lvds_setting'];
+
+      // Keep the SOC from previous update handy just in case
+      $SOC_percentage_previous            = self::$all_usermeta['soc_percentage_now'];
+
+      // get a reading now from the Shelly energy counter
+      $current_energy_counter_wh  = self::get_shelly_device_status_homepwr( $user_index )->energy_total_to_home_ts;
+      $current_power_to_home_wh   = self::get_shelly_device_status_homepwr( $user_index )->power_total_to_home;
+      $current_timestamp          = self::get_shelly_device_status_homepwr( $user_index )->minute_ts;
+      
+      // total energy consumed in KWH from just after dark to now
+      $energy_consumed_since_after_dark_update_kwh = ( $current_energy_counter_wh - $shelly_energy_counter_after_dark ) * 0.001;
+
+      // assumes that grid power is not there. We will have to put in a Shelly to measure that
+      $soc_percentage_discharged = round( $energy_consumed_since_after_dark_update_kwh / $SOC_capacity_KWH *100, 1 ) * 1.07;
+
+      // Change in SOC ( a decrease) from value captured just after dark to now based on energy consumed by home during dark
+      $soc_percentage_now_computed_using_shelly  = $soc_update_from_studer_after_dark - $soc_percentage_discharged;
+
+      // set flag to true for update using Shelly energy readings method
+      self::$soc_updated_using_shelly_energy_readings = true;
+
+      // since Studer reading is null lets updatethe soc using shelly computed value
+      // no need to worry about clamp to 100 since value will only decrease never increase, no solar
+      // update_user_meta( $wp_user_ID, 'soc_percentage_now', $soc_percentage_now_computed_using_shelly );
+
+      // log if verbose is set to true
+      self::$verbose ? error_log( "SOC after dark: " . $soc_update_from_studer_after_dark . 
+                                  "%,  SOC NOW as computed using Shelly: " . 
+                                  $soc_percentage_now_computed_using_shelly . " %") : ' ';
+
+      // compute the condition for LVDS based on shelly calculated SOC
+      $LVDS_shelly_computed = ( $soc_percentage_now_computed_using_shelly <= $soc_percentage_lvds_setting )  &&
+                              ( $shelly_switch_status == "OFF" );
+
+      $return_obj = new stdClass;
+
+      $return_obj->SOC_percentage_previous           = $SOC_percentage_previous;
+      $return_obj->SOC_percentage_now                = $soc_percentage_now_computed_using_shelly;
+
+      $return_obj->LVDS_shelly_computed              = $LVDS_shelly_computed;
+      $return_obj->shelly_api_device_status_ON       = $shelly_api_device_status_ON;
+      $return_obj->shelly_api_device_status_voltage  = $shelly_api_device_status_voltage;
+
+      $return_obj->current_energy_counter_wh         = $current_energy_counter_wh;
+      $return_obj->current_power_to_home_wh          = $current_power_to_home_wh;
+      $return_obj->current_timestamp                 = $current_timestamp;
+      $return_obj->soc_percentage_discharged         = $soc_percentage_discharged;
+      $return_obj->energy_consumed_since_after_dark_update_kwh = $energy_consumed_since_after_dark_update_kwh;
+      
+      
+      return $return_obj;
+    }
+
 
     /**
+     * 
+     */
+    public static function get_all_usermeta( int $user_index , int $wp_user_ID ):array
+    {
+      $all_usermeta = [];
+      // set default timezone to Asia Kolkata
+      self::set_default_timezone();
+
+      $config       = self::get_config();
+
+      $all_usermeta = array_map( function( $a ){ return $a[0]; }, get_user_meta( $wp_user_ID ) );
+
+      self::$all_usermeta = $all_usermeta;
+
+      return $all_usermeta;
+
+      /*
+
+      // SOC percentage needed to trigger LVDS
+      $usermeta['soc_percentage_lvds_setting']            = get_user_meta($wp_user_ID, "soc_percentage_lvds_setting",  true) ?? 30;
+
+      // SOH of battery currently. 
+      $usermeta['soh_percentage_setting']                 = get_user_meta($wp_user_ID, "soh_percentage_setting",  true) ?? 100;
+
+      // Avg Battery Voltage lower threshold for LVDS triggers
+      $usermeta['battery_voltage_avg_lvds_setting']       = get_user_meta($wp_user_ID, "battery_voltage_avg_lvds_setting",  true) ?? 48.3;
+
+      // RDBC active only if SOC is below this percentage level.
+      $usermeta['soc_percentage_rdbc_setting']            = get_user_meta($wp_user_ID, "soc_percentage_rdbc_setting",  true) ?? 80.0;
+
+      // Switch releases if SOC is above this level 
+      $usermeta['soc_percentage_switch_release_setting']  = get_user_meta($wp_user_ID, "soc_percentage_switch_release_setting",  true) ?? 95.0;
+
+      // SOC needs to be higher than this to allow switch release after RDBC
+      $usermeta['min_soc_percentage_for_switch_release_after_rdbc'] 
+                                                          = get_user_meta($wp_user_ID, "min_soc_percentage_for_switch_release_after_rdbc",  true) ?? 32;
+      
+      // min KW of Surplus Solar to release switch after RDBC
+      $usermeta['min_solar_surplus_for_switch_release_after_rdbc'] 
+                                                          = get_user_meta($wp_user_ID, "min_solar_surplus_for_switch_release_after_rdbc",  true) ?? 0.2;
+
+      // battery float voltage setting. Only used for SOC clamp for 100%
+      $usermeta['battery_voltage_avg_float_setting']      = get_user_meta($wp_user_ID, "battery_voltage_avg_float_setting",  true) ?? 51.9;
+
+      // Min VOltage at ACIN for RDBC to switch to GRID
+      $usermeta['acin_min_voltage_for_rdbc']              = get_user_meta($wp_user_ID, "acin_min_voltage_for_rdbc",  true) ?? 199;
+
+      // Max voltage at ACIN for RDBC to switch to GRID
+      $usermeta['acin_max_voltage_for_rdbc']              = get_user_meta($wp_user_ID, "acin_max_voltage_for_rdbc",  true) ?? 241; 
+
+      // KW of deficit after which RDBC activates to GRID. Usually a -ve number
+      $usermeta['psolar_surplus_for_rdbc_setting']        = get_user_meta($wp_user_ID, "psolar_surplus_for_rdbc_setting",  true) ?? -0.5;  
+
+      // Minimum Psolar before RDBC can be actiated
+      $usermeta['psolar_min_for_rdbc_setting']            = get_user_meta($wp_user_ID, "psolar_min_for_rdbc_setting",  true) ?? 0.3;  
+
+      // get operation flags from user meta. Set it to false if not set
+      $usermeta['keep_shelly_switch_closed_always']       = get_user_meta($wp_user_ID, "keep_shelly_switch_closed_always",  true) ?? false;
+
+      // get the user meta that stores the SOC capture calculated from Studer API just after dark
+      $usermeta['soc_update_from_studer_after_dark']      = get_user_meta( $wp_user_ID, 'soc_update_from_studer_after_dark', true);
+
+      $usermeta['shelly_energy_counter_after_dark']       = get_user_meta( $wp_user_ID, 'shelly_energy_counter_after_dark', true);
+
+      $usermeta['timestamp_soc_capture_after_dark']       = get_user_meta( $wp_user_ID, 'timestamp_soc_capture_after_dark', true);
+
+      */
+    }
+
+
+    /**
+     *  @return array containing values from API call on Shelly 4PM including energies, ts, power, soc update
+     */
+    public static function get_shelly_switch_acin_details( int $user_index) : array
+    {
+      $return_array = [];
+
+      // set default timezone to Asia Kolkata
+      self::set_default_timezone();
+
+      $config         = self::get_config();
+
+      // ensure that the data below is current before coming here
+      $all_usermeta = self::$all_usermeta;
+
+      $valid_shelly_config  = ! empty( $config['accounts'][$user_index]['shelly_device_id_acin']   )  &&
+                              ! empty( $config['accounts'][$user_index]['shelly_device_id_homepwr'] ) &&
+                              ! empty( $config['accounts'][$user_index]['shelly_server_uri']  )       &&
+                              ! empty( $config['accounts'][$user_index]['shelly_auth_key']    );
+    
+      if( $all_usermeta['do_shelly_user_meta'] && $valid_shelly_config) 
+      {  // Cotrol Shelly TRUE if usermeta AND valid config
+
+        $control_shelly = true;
+      }
+      else {    // Cotrol Shelly FALSE if usermeta AND valid config FALSE
+        $control_shelly = false;
+      }
+
+      // get the current ACIN Shelly Switch Status. This returns null if not a valid response or device offline
+      if ( $valid_shelly_config ) 
+      {   //  get shelly device status ONLY if valid config for switch
+
+          $shelly_api_device_response = self::get_shelly_device_status_acin( $user_index );
+
+          if ( is_null($shelly_api_device_response) ) { // switch status is unknown
+
+              error_log("Shelly cloud not responding and or device is offline");
+
+              $shelly_api_device_status_ON = null;
+
+              $shelly_switch_status             = "OFFLINE";
+              $shelly_api_device_status_voltage = "NA";
+          }
+          else {  // Switch is ONLINE - Get its status and Voltage
+              
+              $shelly_api_device_status_ON      = $shelly_api_device_response->data->device_status->{"switch:0"}->output;
+              $shelly_api_device_status_voltage = $shelly_api_device_response->data->device_status->{"switch:0"}->voltage;
+
+              if ($shelly_api_device_status_ON)
+                  {
+                      $shelly_switch_status = "ON";
+                  }
+              else
+                  {
+                      $shelly_switch_status = "OFF";
+                  }
+          }
+      }
+      else 
+      {  // no valid configuration for shelly switch set variables for logging info
+
+          $shelly_api_device_status_ON = null;
+
+          $shelly_switch_status             = "Not Configured";
+          $shelly_api_device_status_voltage = "NA";    
+      }  
+
+      $return_array['valid_shelly_config']              = $valid_shelly_config;
+      $return_array['control_shelly']                   = $control_shelly;
+      $return_array['shelly_switch_status']             = $shelly_switch_status;
+      $return_array['shelly_api_device_status_voltage'] = $shelly_api_device_status_voltage;
+
+      self::$shelly_switch_acin_details = $return_array;
+
+      return $return_array;
+    }
+
+
+    /**
+     *  @param int:$rcc_timestamp_localized is what is returned for parameter 5002 from Studer
+     *  We check to see if Studer night is just past midnight
+     */
+    public static function is_studer_time_just_pass_midnight( int $rcc_timestamp_localized, string $wp_user_name ): bool
+    {
+      if ( false === get_transient( $wp_user_name . '_' . 'studer_time_offset_in_mins_lagging' ) )
+      {
+        // create datetime object from studer timestamp. Note that this already has the UTC offeset for India
+        $rcc_datetime_obj = new DateTime();
+        $rcc_datetime_obj->setTimeStamp($rcc_timestamp_localized);
+
+        $now = new DateTimee();
+
+        $diff = $now->diff( $rcc_datetime_obj );
+
+        // positive means lagging behind, negative means leading ahead, of correct server time.
+        // 360 number is there because Studer clock already has this offest built into it.
+        $studer_time_offset_in_mins_lagging = 360 - ( $diff->i  + $diff->h *60);
+
+        set_transient(  $wp_user_name . '_' . 'studer_time_offset_in_mins_lagging',  
+                        $studer_time_offset_in_mins_lagging, 
+                        24*60*60 );
+      }
+      else
+      {
+        $studer_time_offset_in_mins_lagging = get_transient(  $wp_user_name . '_' . 'studer_time_offset_in_mins_lagging' );
+      }
+      $test = new DateTime('NOW', new DateTimeZone('Asia/Kolkata'));
+      $h=$test->format('H');
+      $m=$test->format('i');
+      $s=$test->format('s');
+      if( $h == 0 && ($m - $studer_time_offset_in_mins_lagging) > 0 ) 
+      {
+        return true;
+      }
+      return false;
+    }
+
+
+
+
+    /**
+     *  @return void adds properties to the passed in studer object
+     *  Gets called from the CRON routine after making an API call on Studer for readings
+     *  Just processes the studer readings for SOC update
+     *  Clamps SOC value to 100% if update goes past 100 and or if Vbatt > Float voltage setting
+     * 
+     */
+    public static function compute_soc_using_studer_readings(  int     $user_index, 
+                                                              int     $wp_user_ID, 
+                                                              string  $wp_user_name,
+                                                              object  $studer_readings_obj 
+
+                                                            ) : void
+    { 
+      // set default timezone to Asia Kolkata
+      self::set_default_timezone();
+
+      // get the config array
+      $config       = self::get_config();
+
+      // get the installed battery capacity in KWH from config
+      $SOC_capacity_KWH     = self::$config['accounts'][$user_index]['battery_capacity'];
+
+      // average the battery voltage over last 6 readings of about 6 minutes.
+      $battery_voltage_avg  = self::get_battery_voltage_avg( $studer_readings_obj->battery_voltage_vdc, $wp_user_name );
+
+      // get the estimated solar power from calculations for a clear day
+      $est_solar_kw         = self::estimated_solar_power($user_index);
+
+      $shelly_api_device_status_voltage = self::$shelly_switch_acin_details['shelly_api_device_status_voltage'];
+      $shelly_switch_status             = self::$shelly_switch_acin_details['shelly_switch_status'];
+
+      // Solar power Now
+      $psolar               = $studer_readings_obj->psolar_kw;
+
+      // Check if it is cloudy AT THE MOMENT. Yes if solar is less than half of estimate
+      $it_is_cloudy_at_the_moment = $psolar <= 0.5 * array_sum($est_solar_kw);
+
+      // Solar Current into Battery Junction at present moment
+      $solar_pv_adc         = $studer_readings_obj->solar_pv_adc;
+
+      // Inverter readings at present Instant
+      $pout_inverter        = $studer_readings_obj->pout_inverter_ac_kw;    // Inverter Output Power in KW
+      $grid_input_vac       = $studer_readings_obj->grid_input_vac;         // Grid Input AC Voltage to Studer
+      $inverter_current_adc = $studer_readings_obj->inverter_current_adc;   // DC current into Inverter to convert to AC power
+
+      // Surplus power from Solar after supplying the Load
+      $surplus              = $psolar - $pout_inverter;
+
+      $aux1_relay_state     = $studer_readings_obj->aux1_relay_state;
+
+      // Boolean Variable to designate it is a cloudy day. This is derived from a free external API service
+      $it_is_a_cloudy_day   = self::$cloudiness_forecast->it_is_a_cloudy_day_weighted_average;
+
+      // Weighted percentage cloudiness
+      $cloudiness_average_percentage_weighted = round(self::$cloudiness_forecast->cloudiness_average_percentage_weighted, 0);
+
+      // Get the SOC percentage at beginning of Dayfrom the user meta. This gets updated only at beginning of day, once.
+      $SOC_percentage_beg_of_day       = self::$all_usermeta["soc_percentage"];// get the current Measurement values from the Stider Readings Object
+
+      $KWH_solar_today      = $studer_readings_obj->KWH_solar_today;  // Net SOlar Units generated Today
+      $KWH_grid_today       = $studer_readings_obj->KWH_grid_today;   // Net Grid Units consumed Today
+      $KWH_load_today       = $studer_readings_obj->KWH_load_today;   // Net Load units consumed Today
+
+      // Units of Solar Energy converted to percentage of Battery Capacity Installed
+      $KWH_solar_percentage_today = round( $KWH_solar_today / $SOC_capacity_KWH * 100, 1);
+
+      // Battery discharge today in terms of SOC capacity percventage
+      // $KWH_batt_percent_discharged_today = round( $studer_readings_obj->KWH_batt_discharged_today / $SOC_capacity_KWH * 100, 1);
+
+      // get the SOC % from the previous reading from user meta
+      $SOC_percentage_previous = self::$all_usermeta["soc_percentage_now"];
+
+      // Net battery charge in KWH (discharge if minus)
+      $KWH_batt_charge_net_today  = $KWH_solar_today * 0.96 + (0.988 * $KWH_grid_today - $KWH_load_today) * 1.07;
+
+      // $batt_disc_percentage_calc_from_load = (0.988 * $KWH_grid_today - $KWH_load_today) * 1.10;
+      // $batt_disc_percentage_calc_from_load = round( $batt_disc_percentage_calc_from_load / $SOC_capacity_KWH * 100, 1);
+
+      // Calculate in percentage of  installed battery capacity
+      $SOC_batt_charge_net_percent_today = round( $KWH_batt_charge_net_today / $SOC_capacity_KWH * 100, 1);
+
+      //  Update SOC  number
+      $SOC_percentage_now = $SOC_percentage_beg_of_day + $SOC_batt_charge_net_percent_today;
+        
+        
+
+        // update the object
+        $studer_readings_obj->SOC_percentage_now          = $SOC_percentage_now;
+        $studer_readings_obj->SOC_percentage_previous     = $SOC_percentage_previous;
+        $studer_readings_obj->battery_voltage_avg         = $battery_voltage_avg;
+        $studer_readings_obj->est_solar_kw                = $est_solar_kw;
+        $studer_readings_obj->it_is_cloudy_at_the_moment  = $it_is_cloudy_at_the_moment;
+        $studer_readings_obj->surplus                     = $surplus;
+        $studer_readings_obj->psolar                      = $psolar;
+        $studer_readings_obj->it_is_a_cloudy_day          = $it_is_a_cloudy_day;
+        $studer_readings_obj->shelly_switch_status        = $shelly_switch_status;
+
+        $studer_readings_obj->shelly_api_device_status_voltage        = $shelly_api_device_status_voltage;
+        $studer_readings_obj->cloudiness_average_percentage_weighted  = $cloudiness_average_percentage_weighted;
+        $studer_readings_obj->control_shelly              = $$shelly_switch_acin_details['control_shelly'];
+
+
+        if (self::$verbose)
+        {
+
+            error_log("username: "             . $wp_user_name . ' Switch: ' . $shelly_switch_status . ' ' . 
+                                                 $battery_voltage_avg . ' V, ' . $studer_readings_obj->battery_charge_adc . 'A ' .
+                                                 $shelly_api_device_status_voltage . ' VAC');
+
+            error_log("Psolar_calc: " . array_sum($est_solar_kw) . " Psolar_act: " . $psolar . " - Psurplus: " . 
+                       $surplus . " KW - Is it a Cloudy Day?: " . $it_is_a_cloudy_day);
+        }
+
+        if (  $SOC_percentage_now > 100.0 || $battery_voltage_avg  >=  self::$all_usermeta["battery_voltage_avg_float_setting"] )
+          {
+            // Since we know that the battery SOC is 100% use this knowledge along with
+            // Energy data to recalibrate the soc_percentage user meta
+            $SOC_percentage_beg_of_day_recal = 100 - $SOC_batt_charge_net_percent_today;
+
+            // reset SOC at beginning of day based on 100% SOC and known energy values from Studer API call
+            update_user_meta( $wp_user_ID, 'soc_percentage', $SOC_percentage_beg_of_day_recal);
+
+            error_log("SOC 100% clamp activated: " . $SOC_percentage_beg_of_day_recal  . " %");
+          }
+
+        // SOC Updated using Studer Readings NOT Shelly readings
+        self::$soc_updated_using_shelly_energy_readings = false;  
+
+        return;
+    }
+
+
+    /**
+     *  At Studer clock's just after midnight, the counters are reset for energy totals for the day. We want to catch that
+     *  Check for energy counters to be close to zero and a junmp in SOC 
+     */
+    public static function soc_midnight_rollover_using_studer( string $wp_user_name,  object $studer_readings_obj) :bool
+    {
+      // Check to see if new day accounting has begun. Check for reset of Solar and Load units reset to 0
+
+      $KWH_solar_today      = $studer_readings_obj->KWH_solar_today;  // Net SOlar Units generated Today
+
+      $KWH_load_today       = $studer_readings_obj->KWH_load_today;   // Net Load units consumed Today
+
+      $SOC_percentage_now   = $studer_readings_obj->SOC_percentage_now;
+
+      $SOC_percentage_now   = $studer_readings_obj->SOC_percentage_previous;
+      
+      // 
+      if (  ( $KWH_solar_today <= 0.01 )                                &&    // Solar has been reset to 0
+            ( $KWH_load_today  <= 0.1 )                                 &&
+            ( abs($SOC_percentage_previous - $SOC_percentage_now) > 4 ) &&    // if difference is small we don't care
+            ( self::nowIsWithinTimeLimits("00:00", "00:15") || 
+              self::nowIsWithinTimeLimits("23:45", "23:59:59") )        &&   
+            ( false === get_transient( $wp_user_name . '_' . 'midnight_rollover_yesno' ) ) // did not happen yet
+          )    
+      {
+
+        // Since new day accounting has begun, update user meta for SOC at beginning of new day
+        // This update only happens at beginning of day and also during battery float
+        update_user_meta( $wp_user_ID, 'soc_percentage', $SOC_percentage_previous);
+
+        error_log("SOC value when day rolledover: " . $SOC_percentage_previous  . " %");
+
+        // since the battery nett charge for the new day is 0, SOC now is same as SOC previous
+        $SOC_percentage_now = $SOC_percentage_previous;
+
+        // set transient flag to indicate midnight rollover happened for 7h
+        set_transient( $wp_user_name . '_' . 'midnight_rollover_yesno', 'yes', 7*60*60 );
+
+        return true;
+      }
+
+      return false;
+    }
+
+    /** 
      * Gets all readings from Shelly and Studer and servo's AC IN shelly switch based on conditions
      * @param int:user_index
      * @param int:wp_user_ID
@@ -434,395 +914,229 @@ class class_avas_solar
      * @param bool:do_shelly_user_meta
      * @return object:studer_readings_obj
      */
-    public static function get_readings_and_servo_grid_switch( int $user_index, int $wp_user_ID, string $wp_user_name, bool $do_shelly_user_meta) : ?object
+    public static function get_readings_and_servo_grid_switch(  int $user_index, 
+                                                                int $wp_user_ID, 
+                                                                string $wp_user_name, 
+                                                                bool $do_shelly_user_meta
+                                                              ) : ?object
     {
-        $config         = self::get_config();
+        // set default timezone to Asia Kolkata
+        self::set_default_timezone();
 
-        $valid_shelly_config  = ! empty( $config['accounts'][$user_index]['shelly_device_id_acin']   )  &&
-                                ! empty( $config['accounts'][$user_index]['shelly_device_id_homepwr'] ) &&
-                                ! empty( $config['accounts'][$user_index]['shelly_server_uri']  )       &&
-                                ! empty( $config['accounts'][$user_index]['shelly_auth_key']    );
-        // Get limits from user meta
-        // SOC percentage needed to trigger LVDS
-        $soc_percentage_lvds_setting            = get_user_meta($wp_user_ID, "soc_percentage_lvds_setting",  true) ?? 30;
+        // get the config array
+        $config       = self::get_config();
 
-        // SOH of battery currently. 
-        $soh_percentage_setting                 = get_user_meta($wp_user_ID, "soh_percentage_setting",  true) ?? 100;
+        // get the full user meta for this user index. This will do for both Studer and Shelly called from here
+        $all_usermeta = self::get_all_usermeta($user_index, $wp_user_ID);
 
-        // Avg Battery Voltage lower threshold for LVDS triggers
-        $battery_voltage_avg_lvds_setting       = get_user_meta($wp_user_ID, "battery_voltage_avg_lvds_setting",  true) ?? 48.3;
-
-        // RDBC active only if SOC is below this percentage level.
-        $soc_percentage_rdbc_setting            = get_user_meta($wp_user_ID, "soc_percentage_rdbc_setting",  true) ?? 80.0;
-
-        // Switch releases if SOC is above this level 
-        $soc_percentage_switch_release_setting  = get_user_meta($wp_user_ID, "soc_percentage_switch_release_setting",  true) ?? 95.0; 
-
-        // SOC needs to be higher than this to allow switch release after RDBC
-        $min_soc_percentage_for_switch_release_after_rdbc 
-                                      = get_user_meta($wp_user_ID, "min_soc_percentage_for_switch_release_after_rdbc",  true) ?? 32;
-
-        // min KW of Surplus Solar to release switch after RDBC
-        $min_solar_surplus_for_switch_release_after_rdbc 
-                                      = get_user_meta($wp_user_ID, "min_solar_surplus_for_switch_release_after_rdbc",  true) ?? 0.2; 
-
-        // battery float voltage setting. Only used for SOC clamp for 100%
-        $battery_voltage_avg_float_setting  = get_user_meta($wp_user_ID, "battery_voltage_avg_float_setting",  true) ?? 51.9; 
-
-        // Min VOltage at ACIN for RDBC to switch to GRID
-        $acin_min_voltage_for_rdbc          = get_user_meta($wp_user_ID, "acin_min_voltage_for_rdbc",  true) ?? 199;  
-
-        // Max voltage at ACIN for RDBC to switch to GRID
-        $acin_max_voltage_for_rdbc          = get_user_meta($wp_user_ID, "acin_max_voltage_for_rdbc",  true) ?? 241; 
-
-        // KW of deficit after which RDBC activates to GRID. Usually a -ve number
-        $psolar_surplus_for_rdbc_setting    = get_user_meta($wp_user_ID, "psolar_surplus_for_rdbc_setting",  true) ?? -0.5;  
-
-        // Minimum Psolar before RDBC can be actiated
-        $psolar_min_for_rdbc_setting        = get_user_meta($wp_user_ID, "psolar_min_for_rdbc_setting",  true) ?? 0.3;  
-
-        // get operation flags from user meta. Set it to false if not set
-        $keep_shelly_switch_closed_always = get_user_meta($wp_user_ID, "keep_shelly_switch_closed_always",  true) ?? false;
-
-        if( $do_shelly_user_meta && $valid_shelly_config) {  // Cotrol Shelly TRUE if usermeta AND valid config
-
-            $control_shelly = true;
-        }
-        else {    // Cotrol Shelly FALSE if usermeta AND valid config FALSE
-          $control_shelly = false;
-        }
-
-        // get the current ACIN Shelly Switch Status. This returns null if not a valid response or device offline
-        if ( $valid_shelly_config ) {   //  get shelly device status ONLY if valid config for switch
-
-            $shelly_api_device_response = self::get_shelly_device_status_acin( $user_index );
-
-            if ( is_null($shelly_api_device_response) ) { // switch status is unknown
-
-                error_log("Shelly cloud not responding and or device is offline");
-
-                $shelly_api_device_status_ON = null;
-
-                $shelly_switch_status             = "OFFLINE";
-                $shelly_api_device_status_voltage = "NA";
-            }
-            else {  // Switch is ONLINE - Get its status and Voltage
-                
-                $shelly_api_device_status_ON      = $shelly_api_device_response->data->device_status->{"switch:0"}->output;
-                $shelly_api_device_status_voltage = $shelly_api_device_response->data->device_status->{"switch:0"}->voltage;
-
-                if ($shelly_api_device_status_ON)
-                    {
-                        $shelly_switch_status = "ON";
-                    }
-                else
-                    {
-                        $shelly_switch_status = "OFF";
-                    }
-            }
-        }
-        else {  // no valid configuration for shelly switch set variables for logging info
-
-            $shelly_api_device_status_ON = null;
-
-            $shelly_switch_status             = "Not Configured";
-            $shelly_api_device_status_voltage = "NA";    
-        }
-
-        // Check if it is just after midnight. If so, capture the SOC and the energy values and timestep from Shelly Pro 4PM
-        if ( self::nowIsWithinTimeLimits("00:00", "00:05") )
-        {
-        
-          // it is just after midnight
-          // check if transient for the time step exists and it is today
-          if (  true === get_transient( $wp_user_name . 'timestamp_00' )  && 
-                true === get_transient( $wp_user_name . 'energy_00' )     && 
-                true === self::is_timestamp_todays( get_transient( $wp_user_name . 'timestamp_00' ) )
-              )
-          {
-            // transient exists and it is todays's
-            $timestamp_00 = get_transient( $wp_user_name . 'timestamp_00' ); 
-            $energy_00    = get_transient( $wp_user_name . 'energy_00' );
-          }
-          else
-          {
-            // Valid transient's for midnight energy and timestamp don;t exist, read them in freshly
-            $timestamp_00 = self::get_shelly_device_status_homepwr( $user_index )->minute_ts;
-
-            // set the transient for 24h
-            set_transient( $wp_user_name . 'timestamp_00', $timestamp_00, 24*60*60 );
-
-            // read the energy counter at midnight. This is just some running counter of WHs
-            $energy_00 = self::get_shelly_device_status_homepwr( $user_index )->energy_total_to_home_ts;
-
-            // set the transient for 24h
-            set_transient( $wp_user_name . 'energy_00', $energy_00, 24*60*60 );
-
-            // Get the SOC at present as calculated using Studer values, as saved in user meta
-            $soc_just_after_midnight = get_user_meta($wp_user_ID, "soc_percentage_now",  true) ?? 60.0;
-
-            // set transient for 24h
-            set_transient( $wp_user_name . 'soc_just_after_midnight', $soc_just_after_midnight, 24*60*60 );
-          }   
-        }     // turn of day energy and timestep  from Pro 4PM device
-        
-        
-        // this is dark still after midnight and transents exist calcultae SOC based on shelly 4PM energy readings
-        if (  true === get_transient( $wp_user_name . 'timestamp_00' )                                && 
-              true === get_transient( $wp_user_name . 'energy_00' )                                   && 
-              true === self::is_timestamp_todays( get_transient( $wp_user_name . 'timestamp_00' ) )  &&
-              true === self::nowIsWithinTimeLimits("00:00", "06:30")
-            )
-        {
-          // transient exists and it is todays's and it is  after midnight and still dark so no solar to worry about.
-          $timestamp_00 = get_transient( $wp_user_name . 'timestamp_00' ); 
-          $energy_00    = get_transient( $wp_user_name . 'energy_00' );
-
-          // Get the readings from the Shelly Pro 4 PM for energy, power, and timestamp
-          $current_energy_counter_wh  = self::get_shelly_device_status_homepwr( $user_index )->energy_total_to_home_ts;
-          $current_power_to_home_wh   = self::get_shelly_device_status_homepwr( $user_index )->power_total_to_home;
-          $current_timestamp          = self::get_shelly_device_status_homepwr( $user_index )->minute_ts;
-          
-          $energy_consumed_since_midnight_kwh = ( $current_energy_counter_wh - $energy_00 ) * 0.001;
-
-        }
-
-        
-
-        
-
-        // get the smaller set of Studer readings
-        $studer_readings_obj  = self::get_studer_min_readings($user_index);
-
-        $soc_computed_using_shellypro4pm = self::soc_computed_using_shellypro4pm();
-
-        // check for valid studer values. Return if not valid
-        if( empty(  $studer_readings_obj )                          ||
-            empty(  $studer_readings_obj->battery_voltage_vdc )     ||
-                    $studer_readings_obj->battery_voltage_vdc < 40  ||
-            empty(  $studer_readings_obj->pout_inverter_ac_kw ) ) 
-        {
-            // cannot trust this Studer reading, do not update
-            error_log($wp_user_name . ": " . "Could not get Studer Reading");
-
-            return null;
-        }
-
-        // Load the voltage array that might have been pushed into transient space
-        $bv_arr_transient = get_transient( $wp_user_name . '_bv_avg_arr' );
-
-        if ( ! is_array($bv_arr_transient))
-        {
-          $bv_avg_arr = [];
-        }
-        else
-        {
-          $bv_avg_arr = $bv_arr_transient;
-        }
-        
-        // push the new voltage to the holding array
-        array_push($bv_avg_arr, $studer_readings_obj->battery_voltage_vdc);
-
-        // If the array has more than 3 elements then drop the earliest one
-        // We are averaging for only 3 minutes
-        if ( sizeof($bv_avg_arr) > 3 )  {   // drop the earliest reading
-            array_shift($bv_avg_arr);
-        }
-        // Write it to this object for access elsewhere easily
-        self::$bv_avg_arr = $bv_avg_arr;
-
-        // Setup transiet to keep previous state for averaging
-        set_transient( $wp_user_name . '_bv_avg_arr', $bv_avg_arr, 5*60 );
-
-        // average the battery voltage over last 6 readings of about 6 minutes.
-        $battery_voltage_avg  = self::get_battery_voltage_avg();
-
-        // get the estimated solar power from calculations for a clear day
-        $est_solar_kw         = self::estimated_solar_power($user_index);
-
-        // Solar power Now
-        $psolar               = $studer_readings_obj->psolar_kw;
-
-        // Check if it is cloudy AT THE MOMENT. Yes if solar is less than half of estimate
-        $it_is_cloudy_at_the_moment = $psolar <= 0.5 * array_sum($est_solar_kw);
-
-        // Solar Current into Battery Junction at present moment
-        $solar_pv_adc         = $studer_readings_obj->solar_pv_adc;
-
-        // Inverter readings at present Instant
-        $pout_inverter        = $studer_readings_obj->pout_inverter_ac_kw;    // Inverter Output Power in KW
-        $grid_input_vac       = $studer_readings_obj->grid_input_vac;         // Grid Input AC Voltage to Studer
-        $inverter_current_adc = $studer_readings_obj->inverter_current_adc;   // DC current into Inverter to convert to AC power
-
-        // Surplus power from Solar after supplying the Load
-        $surplus              = $psolar - $pout_inverter;
-
-        $aux1_relay_state     = $studer_readings_obj->aux1_relay_state;
-
-        // Boolean values for checking is present time is within defined time intervals
-        $now_is_daytime       = self::nowIsWithinTimeLimits("08:30", "16:30"); // changed from 17:30  on 7/28/22
-        $now_is_sunset        = self::nowIsWithinTimeLimits("16:31", "16:41");
-
-        // Boolean Variable to designate it is a cloudy day. This is derived from a free external API service
-        $it_is_a_cloudy_day   = self::$cloudiness_forecast->it_is_a_cloudy_day_weighted_average;
-
-        // Weighted percentage cloudiness
-        $cloudiness_average_percentage_weighted = round(self::$cloudiness_forecast->cloudiness_average_percentage_weighted, 0);
-
-        // Get the SOC percentage at beginning of Dayfrom the user meta. This gets updated only at beginning of day, once.
-        $SOC_percentage_beg_of_day       = get_user_meta($wp_user_ID, "soc_percentage",  true) ?? 50;
+        $shelly_switch_acin_details = self::get_shelly_switch_acin_details($user_index, $all_usermeta);
 
         // get the installed battery capacity in KWH from config
         $SOC_capacity_KWH     = self::$config['accounts'][$user_index]['battery_capacity'];
 
-        // get the current Measurement values from the Stider Readings Object
-        $KWH_solar_today      = $studer_readings_obj->KWH_solar_today;  // Net SOlar Units generated Today
-        $KWH_grid_today       = $studer_readings_obj->KWH_grid_today;   // Net Grid Units consumed Today
-        $KWH_load_today       = $studer_readings_obj->KWH_load_today;   // Net Load units consumed Today
-
-        // Units of Solar Energy converted to percentage of Battery Capacity Installed
-        $KWH_solar_percentage_today = round( $KWH_solar_today / $SOC_capacity_KWH * 100, 1);
-
-        // Battery discharge today in terms of SOC capacity percventage
-        $KWH_batt_percent_discharged_today = round( $studer_readings_obj->KWH_batt_discharged_today / $SOC_capacity_KWH * 100, 1);
-
-        if (true)
-        {
-
-            error_log("username: "             . $wp_user_name . ' Switch: ' . $shelly_switch_status . ' ' . 
-                                                 $battery_voltage_avg . ' V, ' . $studer_readings_obj->battery_charge_adc . 'A ' .
-                                                 $shelly_api_device_status_voltage . ' VAC');
-            error_log("Psolar_calc: " . array_sum($est_solar_kw) . " Psolar_act: " . $psolar . " - Psurplus: " . 
-                       $surplus . " KW - Is it a Cloudy Day?: " . $it_is_a_cloudy_day);
         
-            // error_log("Solar Units Today: "    . $KWH_solar_today                          . "KWH");
-            // error_log("Grid Units Today: "     . $KWH_grid_today                           . "KWH");
-            // error_log("Load Units Today: "     . $KWH_load_today                           . "KWH");
-        }
+        // Is it dark now?
+        $it_is_still_dark = self::nowIsWithinTimeLimits( "18:55", "23:59" ) || self::nowIsWithinTimeLimits( "00:00", "06:00" );
 
-        // get the SOC % from the previous reading from user meta
-        $SOC_percentage_previous = get_user_meta($wp_user_ID, "soc_percentage_now",  true) ?? 50.0;
+        // returns true if our timestamp is valid, that is less than 12h from now
+        $soc_after_dark_happened = self::check_if_soc_after_dark_happened( $all_usermeta['timestamp_soc_capture_after_dark'] );
 
-        // Net battery charge in KWH (discharge if minus)
-        $KWH_batt_charge_net_today  = $KWH_solar_today * 0.96 + (0.988 * $KWH_grid_today - $KWH_load_today) * 1.07;
+        switch (true)
+          {
+            case ( $it_is_still_dark && $soc_after_dark_happened ):
+              // We can compute the SOC update using Shelly
+              // Get the readings from the Shelly Pro 4 PM for energy, power, and timestamp and compute new SOC
+              $soc_from_shelly_energy_readings = self::compute_soc_from_shelly_energy_readings( $user_index, 
+                                                                                                $wp_user_ID, 
+                                                                                                $wp_user_name );
 
-        $batt_disc_percentage_calc_from_load = (0.988 * $KWH_grid_today - $KWH_load_today) * 1.10;
-        $batt_disc_percentage_calc_from_load = round( $batt_disc_percentage_calc_from_load / $SOC_capacity_KWH * 100, 1);
+              // is it just after midnight per Studer CLock?
+              if ( self::is_studer_time_just_pass_midnight( $soc_from_shelly_energy_readings->minute_ts, $wp_user_name ) 
+                                  &&
+                 ( false === get_transient( $wp_user_name . '_' . 'midnight_rollover_yesno' ) )
+                  )
+              {
+                // it is indeed just after midnight per Studer Clock and so we can reset SOC midnight rollover
+                // Update user meta for SOC_00 using the present SOC since energy nett in and out is 0 momentarily
+                update_user_meta( $wp_user_ID, 'soc_percentage', $soc_from_shelly_energy_readings->SOC_percentage_now );
 
-        // Calculate in percentage of  installed battery capacity
-        $SOC_batt_charge_net_percent_today = round( $KWH_batt_charge_net_today / $SOC_capacity_KWH * 100, 1);
+                // log this event
+                error_log("SOC value at midnight rolledover: " . $soc_from_shelly_energy_readings->SOC_percentage_now  . " %");
 
-        //  Update SOC  number
-        $SOC_percentage_now = $SOC_percentage_beg_of_day + $SOC_batt_charge_net_percent_today;
+                // set transient flag to indicate midnight rollover happened for 7h
+                set_transient( $wp_user_name . '_' . 'midnight_rollover_yesno', 'yes', 7*60*60 );
+              }
 
-        // set a clamp if the update is bad
-        if ( $SOC_percentage_now < 25 ) {
-          error_log("SOC now bad update: " .  $SOC_percentage_now . " %");
-          $SOC_percentage_now = 25;
-        }
+              // lets update the user meta for computed SOC at the moment
+              update_user_meta( $wp_user_ID, 'soc_percentag_now', $soc_from_shelly_energy_readings->SOC_percentage_now );
 
-        // Check to see if new day accounting has begun. Check for reset of Solar and Load units reset to 0
-        // 
-        if (  ( $KWH_solar_today <= 0.01 )                                &&    // Solar has been reset to 0
-              ( $KWH_load_today  <= 1 )                                   &&
-              ( abs($SOC_percentage_previous - $SOC_percentage_now) > 4 ) &&    // if difference is small we don't care
-              ( self::nowIsWithinTimeLimits("00:00", "00:59") || 
-                self::nowIsWithinTimeLimits("23:00", "23:59:59") )          )    {
+            break;
 
-          // Since new day accounting has begun, update user meta for SOC at beginning of new day
-          // This update only happens at beginning of day and also during battery float
-          update_user_meta( $wp_user_ID, 'soc_percentage', $SOC_percentage_previous);
+            case ( $it_is_still_dark && ( false ===  $soc_after_dark_happened ) ):
+                // SOC after dark has not happened so this is probably just after dark
+                // so lets capture SOC after dark using Studer readings
+                // get Studer Readings using API
+                $studer_readings_obj  = self::get_studer_min_readings($user_index);
 
-          error_log("SOC new day rollover activated: " . $SOC_percentage_previous  . " %");
+                if ( ! empty( $studer_readings_obj ) )
+                {
+                  // computes new value of SOC. DOES NOT update the user meta for updated SOC value
+                  // only updates the SOC value if 100% or float voltage clamp is activated
+                  // But this does not happen at night so we don;t have to worry about that here
+                  self::compute_soc_using_studer_readings( $user_index, $wp_user_ID, $wp_user_name, $studer_readings_obj );
 
-          // since the battery nett charge for the new day is 0, SOC now is same as SOC previous
-          $SOC_percentage_now = $SOC_percentage_previous;
-        }
-        
-        // Update user meta so this becomes the previous value for next cycle
-        update_user_meta( $wp_user_ID, 'soc_percentage_now', $SOC_percentage_now);
+                  // lets update the user meta for computed SOC at the moment
+                  update_user_meta( $wp_user_ID, 'soc_percentag_now', $studer_readings_obj->SOC_percentage_now );
 
-        // update the object and user meta
-        $studer_readings_obj->SOC_percentage_now = $SOC_percentage_now;
+                  // Since Studer SOC update is successfull we can now see if SOC capture after dark is needs to be done.
+                  // The routine checks for all conditions before allowing SOC capture after dark.
+                  self::capture_evening_soc_after_dark( $wp_user_name, $studer_readings_obj->SOC_percentage_now, $user_index ); 
+                  
+                  // SOC midnight rollover rseset doesn't use Studer but is done using Shelly so not here
+                }
+                else
+                {
+                  error_log("SOC after dark could not finish because Studer API call failed. Will retry next iteration");
 
-        if (true)
-        {
-          error_log("S%: " . $KWH_solar_percentage_today . " Dis.%: " . $KWH_batt_percent_discharged_today . 
-                    " SOC_0: " . $SOC_percentage_beg_of_day . "%, SOC Now: " . $SOC_percentage_now . " %" );
-          error_log('Battery Dis %: ' . $batt_disc_percentage_calc_from_load . ' %');
-        }
-        
+                  $soc_from_shelly_energy_readings = self::compute_soc_from_shelly_energy_readings( $user_index, 
+                                                                                                    $wp_user_ID, 
+                                                                                                    $wp_user_name );
+
+                  $soc_from_shelly_energy_readings->shelly_switch_acin_details = $shelly_switch_acin_details;
+
+                  // no SOC update in this case so no update of user meta for SOC now.
+                  self::$soc_updated_using_shelly_energy_readings = null;
+
+                  return $soc_from_shelly_energy_readings;
+                }
+            break;
+
+            case ( false === $it_is_still_dark ):
+                // All cases for which it is not dark so Psolar is being generated
+                // Since we cannot measure Psolar we can only Use Studer readings to make SOC computations
+                $studer_readings_obj = self::get_studer_min_readings($user_index);
+
+                if ( $studer_readings_obj )
+                {
+                  self::compute_soc_using_studer_readings( $user_index, $wp_user_ID, $wp_user_name, $studer_readings_obj );
+
+                  // lets update the user meta for computed SOC at the moment
+                  update_user_meta( $wp_user_ID, 'soc_percentag_now', $studer_readings_obj->SOC_percentage_now );
+                }
+                else
+                {
+                  // Daytime but Studer API call failed so update only Pload and ACIN voltage, and Switch status
+                  $soc_from_shelly_energy_readings = self::compute_soc_from_shelly_energy_readings( $user_index, 
+                                                                                                    $wp_user_ID, 
+                                                                                                    $wp_user_name );
+                  
+                  $soc_from_shelly_energy_readings->shelly_switch_acin_details = $shelly_switch_acin_details;
+
+                  // no SOC update in this case so no update of user meta for SOC now.
+                  self::$soc_updated_using_shelly_energy_readings = null;
+
+                  // Studer was a bust during daytime
+                  error_log( $wp_user_name . ": " . "Could not get valid Studer Reading using API " );
+
+                  return $soc_from_shelly_energy_readings;
+                }
+            break;
+              
+          } // end switch statement
 
         // define all the conditions for the SWITCH - CASE tree
 
         // AC input voltage is being sensed by Studer even though switch status is OFF meaning manual MCB before Studer is ON
         // In this case, since grid is manually switched ON there is nothing we can do
-        $switch_override =  ($shelly_switch_status == "OFF")               &&
-                            ($studer_readings_obj->grid_input_vac >= 190);
+        $switch_override =  ($shelly_switch_acin_details['shelly_switch_status']             == "OFF")          &&
+                            ($shelly_switch_acin_details['shelly_api_device_status_voltage'] >= 190);
 
-        // Independent of Servo Control Flag  - Switch Grid ON due to Low SOC - Don't care about Grid Voltage     
-        $LVDS =             ( $battery_voltage_avg  <= $battery_voltage_avg_lvds_setting || 
-                              $SOC_percentage_now   <= $soc_percentage_lvds_setting           )  &&
-                            ( $shelly_switch_status == "OFF" );					  // The switch is OFF
+        // Independent of Servo Control Flag  - Switch Grid ON due to Low SOC
+        if ( false === self::$soc_updated_using_shelly_energy_readings )
+        {    
+          // SOC update must have been done using Studer Readings, so use studer object and so include battery voltage also
+          $LVDS =      ( $studer_readings_obj->battery_voltage_avg  <= $all_usermeta['battery_voltage_avg_lvds_setting']
+                                                                    || 
+                         $studer_readings_obj->SOC_percentage_now   <= $all_usermeta['soc_percentage_lvds_setting']
+                        )         
+                                                      &&
+                         $shelly_switch_acin_details['shelly_switch_status'] == "OFF";
 
-        // Keep Grid Switch CLosed Untless Solar charges Battery to $soc_percentage_switch_release_setting - 5 or say 90%
-        // So between this and switch_release_float_state battery may cycle up and down by 5 points
-        // Ofcourse if the Psurplus is too much it will charge battery to 100% inspite of this.
-        // Obviously after sunset the battery will remain at 90% till sunrise the next day
-        $keep_switch_closed_always =  ( $shelly_switch_status == "OFF" )             &&
-                                      ( $keep_shelly_switch_closed_always == true )  &&
-                                      ( $SOC_percentage_now <= ($soc_percentage_switch_release_setting - 5) )	&&  // OR SOC reached 90%
-                                      ( $control_shelly == true );
+          // Keep Grid Switch CLosed Untless Solar charges Battery to $soc_percentage_switch_release_setting - 5 or say 90%
+          // So between this and switch_release_float_state battery may cycle up and down by 5 points
+          // Ofcourse if the Psurplus is too much it will charge battery to 100% inspite of this.
+          // Obviously after sunset the battery will remain at 90% till sunrise the next day
+          $keep_switch_closed_always =  
+                  ( $shelly_switch_acin_details['shelly_switch_status'] == "OFF" )             &&
+                  ( $all_usermeta['keep_shelly_switch_closed_always']   == true )              &&
+                  ( $studer_readings_obj->SOC_percentage_now            <= ( $all_usermeta['soc_percentage_switch_release_setting'] - 5 ) )	&& 
+                  ( $shelly_switch_acin_details['control_shelly']       == true );
 
+          $reduce_daytime_battery_cycling = 
+                  ( $shelly_switch_acin_details['shelly_switch_status'] == "OFF" )              &&  // Switch is OFF
+                  ( $studer_readings_obj->SOC_percentage_now            <= $all_usermeta['soc_percentage_rdbc_setting'] )	&&	// Battery NOT in FLOAT state
+                  ( $shelly_switch_acin_details['shelly_api_device_status_voltage'] >= $all_usermeta['acin_min_voltage_for_rdbc']	)	&&	// ensure Grid AC is not too low
+                  ( $shelly_switch_acin_details['shelly_api_device_status_voltage'] <= $all_usermeta['acin_max_voltage_for_rdbc']	)	&&	// ensure Grid AC is not too high
+                  ( self::nowIsWithinTimeLimits("08:30", "16:30") )                             &&   // Now is Daytime
+                  ( $studer_readings_obj->psolar                        >= $all_usermeta['psolar_min_for_rdbc_setting'] ) &&   // at least some solar generation
+                  ( $studer_readings_obj->surplus                       <= $all_usermeta['psolar_surplus_for_rdbc_setting'] ) &&  // Solar Deficit is negative
+                  ( $studer_readings_obj->it_is_cloudy_at_the_moment )                          &&   // Only when it is cloudy
+                  ( $shelly_switch_acin_details['control_shelly']       == true );                   // Control Flag is SET
 
-        $reduce_daytime_battery_cycling = ( $shelly_switch_status == "OFF" )              &&  // Switch is OFF
-                                          ( $SOC_percentage_now <= $soc_percentage_rdbc_setting )	&&	// Battery NOT in FLOAT state
-                                          ( $shelly_api_device_status_voltage >= $acin_min_voltage_for_rdbc	)	&&	// ensure Grid AC is not too low
-                                          ( $shelly_api_device_status_voltage <= $acin_max_voltage_for_rdbc	)	&&	// ensure Grid AC is not too high
-                                          ( $now_is_daytime )                             &&   // Now is Daytime
-                                          ( $psolar  >= $psolar_min_for_rdbc_setting )    &&   // at least some solar generation
-                                          ( $surplus <= $psolar_surplus_for_rdbc_setting ) &&  // Solar Deficit is negative
-                                          ( $it_is_cloudy_at_the_moment )                 &&   // Only when it is cloudy
-                                          ( $control_shelly == true );                         // Control Flag is SET
-        // switch release typically after RDBC when Psurplus is positive.
-        $switch_release =  ( $SOC_percentage_now >= ( $soc_percentage_lvds_setting + 0.3 ) ) &&  // SOC ?= LBDS + offset
-                           ( $shelly_switch_status == "ON" )  														  &&  // Switch is ON now
-                           ( $surplus >= $min_solar_surplus_for_switch_release_after_rdbc ) &&  // Solar surplus is >= 0.2KW
-                           ( $keep_shelly_switch_closed_always == false )                   &&	// Emergency flag is False
-                           ( $control_shelly == true );                                         // Control Flag is SET                              
+          // switch release typically after RDBC when Psurplus is positive.
+          $switch_release =  
+                  ( $studer_readings_obj->SOC_percentage_now            >= ( $all_usermeta['soc_percentage_lvds_setting'] + 0.3 ) ) &&  // SOC ?= LBDS + offset
+                  ( $shelly_switch_acin_details['shelly_switch_status'] == "ON" )  														  &&  // Switch is ON now
+                  ( $studer_readings_obj->surplus                       >= $all_usermeta['min_solar_surplus_for_switch_release_after_rdbc'] ) &&  // Solar surplus is >= 0.2KW
+                  ( $all_usermeta['keep_shelly_switch_closed_always']   == false )              &&	// Emergency flag is False
+                  ( $shelly_switch_acin_details['control_shelly']       == true );
 
-        // In general we want home to be on Battery after sunset
-        $sunset_switch_release			=	( $keep_shelly_switch_closed_always == false )  &&  // Emergency flag is False
-                                      ( $shelly_switch_status == "ON" )               &&  // Switch is ON now
-                                      ( $now_is_sunset )                              &&  // around sunset
-                                      ( $control_shelly == true );
+          // This is needed when RDBC or always ON was triggered and Psolar is charging battery beyond 95%
+          // independent of keep_shelly_switch_closed_always flag status
+          $switch_release_float_state	= 
+                  ( $shelly_switch_acin_details['shelly_switch_status'] == "ON" )  							&&  // Switch is ON now
+                  ( $studer_readings_obj->SOC_percentage_now            >= $all_usermeta['soc_percentage_switch_release_setting'] )	&&  // OR SOC reached 95%
+                  ( $shelly_switch_acin_details['control_shelly']       == true );                  // Control Flag is False
 
-        // This is needed when RDBC or always ON was triggered and Psolar is charging battery beyond 95%
-        // independent of keep_shelly_switch_closed_always flag status
-        $switch_release_float_state	= ( $shelly_switch_status == "ON" )  							&&  // Switch is ON now
-                                      ( $SOC_percentage_now >= $soc_percentage_switch_release_setting )	&&  // OR SOC reached 95%
-                                      // ( $keep_shelly_switch_closed_always == false )  &&  // Always ON flag is OFF
-                                      ( $control_shelly == true );                        // Control Flag is False
+          $studer_readings_obj->LVDS                              = $LVDS;
+          $studer_readings_obj->reduce_daytime_battery_cycling    = $reduce_daytime_battery_cycling;
+          $studer_readings_obj->switch_release                    = $switch_release;
+          $studer_readings_obj->switch_release_float_state        = $switch_release_float_state;
 
-        // write back new values to the readings object
-        $studer_readings_obj->battery_voltage_avg               = $battery_voltage_avg;
-        $studer_readings_obj->now_is_daytime                    = $now_is_daytime;
-        $studer_readings_obj->now_is_sunset                     = $now_is_sunset;
-        $studer_readings_obj->shelly_api_device_status_ON       = $shelly_api_device_status_ON;
-        $studer_readings_obj->shelly_api_device_status_voltage  = $shelly_api_device_status_voltage;
+          $error_log_message = "SOC: " . $studer_readings_obj->SOC_percentage_now . 
+                               " % Battery Voltage: " . $studer_readings_obj->battery_voltage_avg . " V";
+        }
+        elseif ( false === self::$soc_updated_using_shelly_energy_readings )
+        {
+          // SOC was updated using Shelly readings, so no battery voltage data
+          $LVDS = $soc_from_shelly_energy_readings->SOC_percentage_now 
+                                                                        <= $all_usermeta['soc_percentage_lvds_setting']
+                                                  &&
+                  $shelly_switch_acin_details['shelly_switch_status'] == "OFF" ;
 
-        $studer_readings_obj->LVDS                              = $LVDS;
-        $studer_readings_obj->reduce_daytime_battery_cycling    = $reduce_daytime_battery_cycling;
-        $studer_readings_obj->switch_release                    = $switch_release;
-        $studer_readings_obj->sunset_switch_release             = $sunset_switch_release;
-        $studer_readings_obj->switch_release_float_state        = $switch_release_float_state;
-        $studer_readings_obj->control_shelly                    = $control_shelly;
+          $keep_switch_closed_always =  
+                  ( $shelly_switch_acin_details['shelly_switch_status'] == "OFF" )             &&
+                  ( $all_usermeta['keep_shelly_switch_closed_always']   == true )              &&
+                  ( $soc_from_shelly_energy_readings->soc_percentage_now_computed_using_shelly 
+                                                                        <= ( $all_usermeta['soc_percentage_switch_release_setting'] - 5 ) )	&& 
+                  ( $shelly_switch_acin_details['control_shelly']       == true );
 
-        $studer_readings_obj->cloudiness_average_percentage_weighted  = $cloudiness_average_percentage_weighted;
-        $studer_readings_obj->est_solar_kw  = round( array_sum($est_solar_kw), 1);
+          $soc_from_shelly_energy_readings->LVDS                      = $LVDS;
+          $soc_from_shelly_energy_readings->keep_switch_closed_always = $keep_switch_closed_always;
+
+          $error_log_message = "SOC: " . $studer_readings_obj->SOC_percentage_now .  " %";
+          
+        }                        
+
+        // In general we want home to be on Battery after sunset. This is independent of Studer or Shelly mode of SOC update
+        $sunset_switch_release			=	
+                  ( $all_usermeta['keep_shelly_switch_closed_always']   == false )  &&  // Emergency flag is False
+                  ( $shelly_switch_acin_details['shelly_switch_status'] == "ON" )               &&  // Switch is ON now
+                  ( self::nowIsWithinTimeLimits("16:31", "16:41") )                             &&  // around sunset
+                  ( $shelly_switch_acin_details['control_shelly']       == true );
+
         
-
-        switch(true)
+        switch( true )
         {
             // if Shelly switch is OPEN but Studer transfer relay is closed and Studer AC voltage is present
             // it means that the ACIN is manually overridden at control panel
@@ -842,7 +1156,7 @@ class class_avas_solar
 
                 self::turn_on_off_shelly_switch($user_index, "on");
 
-                error_log("LVDS - Grid ON.  SOC: " . $SOC_percentage_now . " % and Vbatt(V): " . $battery_voltage_avg);
+                error_log("LVDS: " . $error_log_message);
                 $cron_exit_condition = "Low SOC - Grid ON";
             break;
 
@@ -872,7 +1186,7 @@ class class_avas_solar
 
                 self::turn_on_off_shelly_switch($user_index, "off");
 
-                error_log("SOC ok-Grid Off");
+                error_log("SOC ok-Grid Off " . $error_log_message);
                 $cron_exit_condition = "SOC ok-Grid Off";
             break;
 
@@ -891,7 +1205,7 @@ class class_avas_solar
 
                 self::turn_on_off_shelly_switch($user_index, "off");
 
-                error_log("SOC Float-Grid Off");
+                error_log("SOC Float-Grid Off " . $error_log_message);
                 $cron_exit_condition = "SOC Float-Grid Off";
             break;
 
@@ -910,29 +1224,121 @@ class class_avas_solar
                             'cron_exit_condition' => $cron_exit_condition ,
                           ];
 
-        // save the data in a transient indexed by the user name. Expiration is 5 minutes
-        set_transient( $wp_user_name . '_studer_readings_object', $studer_readings_obj, 5*60 );
-
         // Update the user meta with the CRON exit condition only fir definite ACtion not for no action
         if ($cron_exit_condition !== "No Action") 
           {
               update_user_meta( $wp_user_ID, 'studer_readings_object',  json_encode( $array_for_json ));
           }
 
-        if (  $SOC_percentage_now > 100.0 || $battery_voltage_avg  >=  $battery_voltage_avg_float_setting )
-          {
-            // Since we know that the battery SOC is 100% use this knowledge along with
-            // Energy data to recalibrate the soc_percentage user meta
-            $SOC_percentage_beg_of_day_recal = 100 - $SOC_batt_charge_net_percent_today;
+        // save the data in a transient indexed by the user name. Expiration is 5 minutes
+        if ( false === self::$soc_updated_using_shelly_energy_readings )
+        {
+          set_transient( $wp_user_name . "_" . "studer_readings_object", $studer_readings_obj, 5*60 );
 
-            update_user_meta( $wp_user_ID, 'soc_percentage', $SOC_percentage_beg_of_day_recal);
+          delete_transient( $wp_user_name . '_' . 'soc_from_shelly_energy_readings' );
 
-            error_log("SOC 100% clamp activated: " . $SOC_percentage_beg_of_day_recal  . " %");
-          }
-        
+          return $studer_readings_obj;
+        }
+        else
+        {
+          set_transient( $wp_user_name . '_' . 'soc_from_shelly_energy_readings', $soc_from_shelly_energy_readings, 5*60 );
 
-        return $studer_readings_obj;
+          delete_transient( $wp_user_name . '_' . 'studer_readings_object' ); 
+          
+          return $soc_from_shelly_energy_readings;
+        }
+
     }
+
+    /**
+     *  @param int:$timestamp_soc_capture_after_dark is the UNIX timestamp when the SOC capture after dark took place
+     *  @return bool
+     *  Check if SOC capture after dark took place based on timestamp
+     */
+    public static function check_if_soc_after_dark_happened( $timestamp_soc_capture_after_dark ) :bool
+    {
+      self::set_default_timezone();
+
+      if ( empty( $timestamp_soc_capture_after_dark ) )
+      {
+        // timestamp is not valid
+        return false;
+      }
+      
+      // If now daytime, we don't want to use this so set flag as false
+      if ( self::nowIsWithinTimeLimits("06:01", "18:54") ) return false;
+
+      // we have a non-emty timestamp. To check if it is valid.
+      // It is valid if the timestamp is after 6:55 PM and is within the last 12h
+      $now = new DateTime();
+
+      $datetimeobj_from_timestamp = new DateTime();
+      $datetimeobj_from_timestamp->setTimestamp($timestamp_soc_capture_after_dark);
+
+      // form the intervel object
+      $diff = $now->diff( $datetimeobj_from_timestamp );
+
+      $hours = $diff->h;
+      $hours = $hours + ($diff->days*24);
+
+      if ( $hours < 12 )
+      {
+        return true;
+      }
+      return false;
+    }
+
+
+    /**
+     *  If now is after 6:55PM and before 11PM today and if timestamp is not yet set then capture soc
+     *  The transients are set to last 4h so if capture happens at 6PM transients expire at 11PM
+     *  However the captured values are saved to user meta for retrieval.
+     *  @preturn bool:true if SOC capture happened this run, false if it did not happen
+     */
+    public static function capture_evening_soc_after_dark( $wp_user_name, $SOC_percentage_now, $user_index ) : bool
+    {
+      // set default timezone to Asia Kolkata
+      self::set_default_timezone();
+
+      $now = new DateTime();
+
+      if ( empty( $SOC_percentage_now) ) return false;
+
+      // check if it is after dark and before midnightdawn annd that the transient has not been set yet
+      // A wide window is given for capture because Studer API calls may fail and a small window may be missed out
+      if (  self::nowIsWithinTimeLimits("18:55", "23:00")   && 
+            ( false === get_transient( $wp_user_name . '_' . 'timestamp_soc_capture_after_dark' ) )
+          ) 
+      {
+        // This routine should execute just once after dark. If transient gets deleted then it will get executed again
+        // Now read the Shelly Pro 4 PM energy meter for energy counter and imestamp
+        $timestamp_soc_capture_after_dark = self::get_shelly_device_status_homepwr( $user_index )->minute_ts;
+
+        $shelly_energy_counter_after_dark = self::get_shelly_device_status_homepwr( $user_index )->energy_total_to_home_ts;
+
+        set_transient( $wp_user_name . '_' . 'timestamp_soc_capture_after_dark',  $timestamp_soc_capture_after_dark, 12*60*60 );
+
+        set_transient( $wp_user_name . '_' . 'shelly_energy_counter_after_dark',  $shelly_energy_counter_after_dark, 12*60*60 );
+
+        // Capture the SOC value as computed from studer readings valid for next 12 hours
+        set_transient( $wp_user_name . '_' . 'soc_update_from_studer_after_dark', $SOC_percentage_now, 12 * 60 *60 );
+
+
+        update_user_meta( $wp_user_ID, 'shelly_energy_counter_after_dark', $shelly_energy_counter_after_dark);
+
+        update_user_meta( $wp_user_ID, 'timestamp_soc_capture_after_dark', $timestamp_soc_capture_after_dark);
+
+        // update the user meta just inc  case transients get deleted, as a safety
+        update_user_meta( $wp_user_ID, 'soc_update_from_studer_after_dark', $SOC_percentage_now);
+
+        error_log("SOC Capture after dark happened - SOC: " . $SOC_percentage_now . " %, Energy Counter: " . $shelly_energy_counter_after_dark);
+
+        return true;
+      }
+      return false;
+    }
+
+
 
     /**
      *  @param int:timestamp_00
@@ -1504,8 +1910,35 @@ class class_avas_solar
     /**
      *  Takes the average of the battery values stored in the array, independent of its size
      */
-    public static function get_battery_voltage_avg( array $bv_avg_arr ) : float
+    public static function get_battery_voltage_avg( float $latest_reading, string $wp_user_name ) : float
     {
+        // Load the voltage array that might have been pushed into transient space
+        $bv_arr_transient = get_transient( $wp_user_name . '_' . 'bv_avg_arr' );
+
+        if ( ! is_array($bv_arr_transient))
+        {
+          $bv_avg_arr = [];
+        }
+        else
+        {
+          $bv_avg_arr = $bv_arr_transient;
+        }
+        
+        // push the new voltage to the holding array
+        array_push( $bv_avg_arr, $latest_reading );
+
+        // If the array has more than 3 elements then drop the earliest one
+        // We are averaging for only 3 minutes
+        if ( sizeof($bv_avg_arr) > 3 )  
+        {   // drop the earliest reading
+            array_shift($bv_avg_arr);
+        }
+        // Write it to this object for access elsewhere easily
+        self::$bv_avg_arr = $bv_avg_arr;
+
+        // Setup transiet to keep previous state for averaging
+        set_transient( $wp_user_name . '_bv_avg_arr', $bv_avg_arr, 5*60 );
+
         $count  = 0.00001;    // prevent division by 0 error
         $sum    = 0;
         foreach ($bv_avg_arr as $key => $bv_reading)
@@ -1522,9 +1955,11 @@ class class_avas_solar
         return ( round( $sum / $count, 2) );
     }
 
+
+
     /**
-     *  @param string:$start
-     *  @param string:$stop
+     *  @param string:$start start time today
+     *  @param string:$stop  stop time today
      *  @return bool true if current time is within the time limits specified otherwise false
      */
     public static function nowIsWithinTimeLimits(string $start_time, string $stop_time): bool
@@ -1532,8 +1967,8 @@ class class_avas_solar
         date_default_timezone_set("Asia/Kolkata");
 
         $now =  new DateTime();
-        $begin = new DateTime($start_time);
-        $end   = new DateTime($stop_time);
+        $begin = new DateTime($start_time); // today
+        $end   = new DateTime($stop_time);  // today
 
         if ($now >= $begin && $now <= $end)
         {
@@ -1975,6 +2410,25 @@ class class_avas_solar
     /**
      *
      */
+    public static function turn_on_off_shelly_switch_acin($user_index, $desired_state)
+    {
+        $config = self::$config;
+        $shelly_server_uri  = $config['accounts'][$user_index]['shelly_server_uri'];
+        $shelly_auth_key    = $config['accounts'][$user_index]['shelly_auth_key'];
+        $shelly_device_id   = $config['accounts'][$user_index]['shelly_device_id_acin'];
+
+        $shelly_api    =  new shelly_cloud_api($shelly_auth_key, $shelly_server_uri, $shelly_device_id);
+
+        // this is $curl_response
+        $shelly_device_data = $shelly_api->turn_on_off_shelly_switch($desired_state);
+
+        return $shelly_device_data;
+    }
+
+
+    /**
+     *
+     */
     public static function turn_on_off_shelly_switch($user_index, $desired_state)
     {
         $config = self::$config;
@@ -1985,7 +2439,7 @@ class class_avas_solar
         $shelly_api    =  new shelly_cloud_api($shelly_auth_key, $shelly_server_uri, $shelly_device_id);
 
         // this is $curl_response
-        $shelly_device_data = $shelly_api->turn_on_off_shelly_switch($desired_state);
+        // $shelly_device_data = $shelly_api->turn_on_off_shelly_switch($desired_state);
 
         return $shelly_device_data;
     }
@@ -2023,7 +2477,9 @@ class class_avas_solar
         return $shelly_device_data;
     }
 
-
+    /**
+     *  @return object:$shelly_device_data contains energy counter and its timestamp along with switch status object
+     */
     public static function get_shelly_device_status_homepwr(int $user_index): ?object
     {
         // get API and device ID from config based on user index
@@ -2037,17 +2493,25 @@ class class_avas_solar
         // this is $curl_response.
         $shelly_device_data = $shelly_api->get_shelly_device_status();
 
+        // check to make sure that it exists. If null API call was fruitless
+        if ( empty( $shelly_device_data ) )
+        {
+          return null;
+        }
+
         // Since this is the switch that also measures the power and energy to home, let;s extract those details
         $power_channel_0 = $shelly_api_device_response->data->device_status->{"switch:0"}->apower;
         $power_channel_1 = $shelly_api_device_response->data->device_status->{"switch:1"}->apower;
         $power_channel_2 = $shelly_api_device_response->data->device_status->{"switch:2"}->apower;
         $power_channel_3 = $shelly_api_device_response->data->device_status->{"switch:3"}->apower;
+
         $power_total_to_home = $power_channel_0 + $power_channel_1 + $power_channel_2 + $power_channel_3;
 
         $energy_channel_0_ts = $shelly_api_device_response->data->device_status->{"switch:0"}->aenergy->total;
         $energy_channel_1_ts = $shelly_api_device_response->data->device_status->{"switch:1"}->aenergy->total;
         $energy_channel_2_ts = $shelly_api_device_response->data->device_status->{"switch:2"}->aenergy->total;
         $energy_channel_3_ts = $shelly_api_device_response->data->device_status->{"switch:3"}->aenergy->total;
+
         $energy_total_to_home_ts = $energy_channel_0_ts + $energy_channel_1_ts + $energy_channel_2_ts + $energy_channel_3_ts;
 
         // Unix minute time stamp for the power and energy readings
@@ -2564,7 +3028,7 @@ class class_avas_solar
                               "infoAssembly"  => "2"
                             ),
                       array(
-                              "userRef"       =>  3010,   // Phase of battery charge
+                              "userRef"       =>  5002,   // RCC time in UNIX timestamp but  with India TZ already added
                               "infoAssembly"  => "Master"
                             ),
                       );
@@ -2588,6 +3052,10 @@ class class_avas_solar
         {
           switch (true)
           {
+            case ( $user_value->reference == 5002 ) :
+              $rcc_timestamp_localized = $user_value->value; // This is the timestamp from STuder with India offset added already
+            break;
+
             case ( $user_value->reference == 3031 ) :
               $aux1_relay_state = $user_value->value;
             break;
@@ -2871,8 +3339,24 @@ class class_avas_solar
 
       $studer_readings_obj->KWH_batt_discharged_today    = $KWH_batt_discharged_today;
 
+      // Timestamp already adjusted for India, obtained from Studer
+      $studer_readings_obj->rcc_timestamp_localized    = $rcc_timestamp_localized;
+
+      self::$studer_readings_obj = $studer_readings_obj;
+
       return $studer_readings_obj;
     }
+
+    /**
+     * Check if 
+     */
+    public static function capture_midnight_soc_if_studer_is_offline( $user_index )
+    {
+
+    }
+
+
+
 
     /**
      *  service AJax Call for minutely cron updates to my solar page of website

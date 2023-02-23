@@ -68,6 +68,10 @@ function this_plugin_init()
     // add_action('init','custom_login');
     // add action to load the javascripts on non-admin page
     add_action( 'wp_enqueue_scripts', 'add_my_scripts' );
+
+    // no initialization needed, this is done in the class itlsef afer loading
+    // run the static initialization function of the main class. Loads the config and sets constants
+    // class_avas_solar::init();
 }
 
 
