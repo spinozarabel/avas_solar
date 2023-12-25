@@ -15,7 +15,7 @@ class shelly_cloud_api
 {
     const VERBOSE     = false;
 
-    public function __construct(string $auth_key, string $server_uri, string $shelly_device_id)
+    public function __construct(string $auth_key, string $server_uri, string $shelly_device_id , int $channel = 0 )
     {
       $this->verbose  = self::VERBOSE;
 
@@ -23,17 +23,19 @@ class shelly_cloud_api
 	  $this->server_uri	          = $server_uri;  // The server uri can be obtained 
                                               // on the same page where the authorization key is generated
       $this->shelly_device_id     = $shelly_device_id;
+
+      $this->channel = $channel ?? 0;
     }       // end construct function
 
     /**
      * @param string:$desired_state is "on" or 'off'
      */
-    public function turn_on_off_shelly_switch($desired_state)
+    public function turn_on_off_shelly_switch(string $desired_state )
     {
        // parameters for query string
       $params     = array
       (
-          "channel"     => 0,
+          "channel"     => $this->channel           ,
           'turn'        => $desired_state           ,
           "id"          => $this->shelly_device_id  ,
           "auth_key"    => $this->auth_key          ,
